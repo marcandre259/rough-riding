@@ -64,7 +64,7 @@ print('Model cached successfully.')
 "
 
 # ── Make scripts executable ──
-chmod +x dictate_app.py dictate.sh
+chmod +x dictate_app.py
 
 # ── Create .app bundle ──
 echo "==> Creating Dictate.app bundle..."
