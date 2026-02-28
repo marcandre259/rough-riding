@@ -15,6 +15,7 @@ import subprocess
 import threading
 
 import rumps
+from rumps import events
 from PyObjCTools.AppHelper import callAfter
 
 # ── Paths ──
@@ -47,21 +48,37 @@ class DictateApp(rumps.App):
         super().__init__("Dictate", quit_button=None)
         self.title = ICON_IDLE
         self.recording_proc = None
+        self.transcribe_proc = None
         self.is_recording = False
         self.is_transcribing = False
-        self._register_hotkey()
+        events.before_start.register(self._register_hotkey)
         log.info("DictateApp initialized")
 
     # ── Helper: look up toggle item fresh every time ──
     def _set_toggle_title(self, title):
         self.menu["Start Recording"].title = title
 
+    # ── Helper: SIGTERM with timeout, then SIGKILL fallback ──
+    def _force_kill(self, proc, name="process"):
+        if proc is None or proc.poll() is not None:
+            return
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            log.warning("%s did not exit after SIGTERM, sending SIGKILL", name)
+            proc.kill()
+            proc.wait(timeout=2)
+
     # ── Menu callbacks via @rumps.clicked ──
 
     @rumps.clicked("Start Recording")
     def on_toggle(self, sender):
-        log.info("on_toggle called, is_recording=%s", self.is_recording)
+        log.info("on_toggle called, is_recording=%s, is_transcribing=%s",
+                 self.is_recording, self.is_transcribing)
         if self.is_transcribing:
+            log.info("Cancelling transcription")
+            self._force_kill(self.transcribe_proc, "transcription")
             return
         if self.is_recording:
             self._stop_recording()
@@ -70,10 +87,8 @@ class DictateApp(rumps.App):
 
     @rumps.clicked("Quit")
     def on_quit(self, sender):
-        if self.recording_proc:
-            self.recording_proc.send_signal(signal.SIGTERM)
-            self.recording_proc.wait()
-            log.info("Killed recording on quit")
+        self._force_kill(self.recording_proc, "recording")
+        self._force_kill(self.transcribe_proc, "transcription")
         log.info("Quitting")
         rumps.quit_application()
 
@@ -137,11 +152,10 @@ class DictateApp(rumps.App):
 
         self.is_recording = False
         self.title = ICON_TRANSCRIBING
-        self._set_toggle_title("Transcribing...")
+        self._set_toggle_title("Cancel Transcription")
 
         # SIGTERM lets sox write proper WAV headers
-        self.recording_proc.send_signal(signal.SIGTERM)
-        self.recording_proc.wait()
+        self._force_kill(self.recording_proc, "recording")
         self.recording_proc = None
         log.info("Recording stopped")
 
@@ -157,18 +171,23 @@ class DictateApp(rumps.App):
                 return
 
             log.info("Transcribing %s", RECORDING_PATH)
-            result = subprocess.run(
+            self.transcribe_proc = subprocess.Popen(
                 [VENV_PYTHON, TRANSCRIBE_SCRIPT, RECORDING_PATH],
-                capture_output=True,
-                text=True,
-                timeout=120,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-
-            if result.returncode != 0:
-                log.error("Transcription failed: %s", result.stderr.strip())
+            try:
+                stdout, stderr = self.transcribe_proc.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                self._force_kill(self.transcribe_proc, "transcription")
+                log.error("Transcription timed out")
                 return
 
-            text = result.stdout.strip()
+            if self.transcribe_proc.returncode != 0:
+                log.error("Transcription failed: %s", stderr.decode().strip())
+                return
+
+            text = stdout.decode().strip()
             if not text:
                 log.info("No speech detected")
                 return
@@ -189,11 +208,10 @@ class DictateApp(rumps.App):
                 check=False,
             )
 
-        except subprocess.TimeoutExpired:
-            log.error("Transcription timed out")
         except Exception as e:
             log.error("Transcription error: %s", e)
         finally:
+            self.transcribe_proc = None
             if os.path.exists(RECORDING_PATH):
                 os.unlink(RECORDING_PATH)
             # Schedule UI reset on the main thread — rumps.Timer from a background
